@@ -163,6 +163,7 @@ func DefaultToolsetGroup(readOnly bool, getClient GetClientFn, getGQLClient GetG
 		AddReadTools(
 			toolsets.NewServerTool(ListGlobalSecurityAdvisories(getClient, t)),
 			toolsets.NewServerTool(GetGlobalSecurityAdvisory(getClient, t)),
+			toolsets.NewServerTool(ListRepositorySecurityAdvisories(getClient, t)),
 		)
 
 	// Keep experiments alive so the system doesn't error out when it's always enabled

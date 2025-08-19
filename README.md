@@ -937,6 +937,13 @@ The following sets of tools are available (all are on by default):
   - `type`: Advisory type. (string, optional)
   - `updated`: Filter by update date or date range (ISO 8601 date or range). (string, optional)
 
+- **list_repository_security_advisories** - List repository security advisories
+  - `direction`: Sort direction. (string, optional)
+  - `owner`: The owner of the repository. (string, required)
+  - `repo`: The name of the repository. (string, required)
+  - `sort`: Sort field. (string, optional)
+  - `state`: Filter by advisory state. (string, optional)
+
 </details>
 
 <details>
