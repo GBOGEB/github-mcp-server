@@ -62,14 +62,15 @@ jobs:
             | tee "$RUNNER_TEMP/m03-get-file-help.txt"
           grep -q -- "--owner" "$RUNNER_TEMP/m03-get-file-help.txt"
           grep -q -- "--repo" "$RUNNER_TEMP/m03-get-file-help.txt"
+          grep -q -- "--sha" "$RUNNER_TEMP/m03-get-file-help.txt"
 
-      - name: Execute real read-only GitHub MCP operation
+      - name: Execute and validate real read-only GitHub MCP operation
         id: live_read
         working-directory: official
         run: |
           set -euo pipefail
           SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
-          RESPONSE="$RUNNER_TEMP/m03-live-read-response.json"
+          RESPONSE="$GITHUB_WORKSPACE/m03_live_read_response.json"
           "$RUNNER_TEMP/mcpcurl" \
             --pretty=false \
             --stdio-server-cmd "$SERVER_CMD" \
@@ -77,6 +78,7 @@ jobs:
             --owner github \
             --repo github-mcp-server \
             --path README.md \
+            --sha "$OFFICIAL_SHA" \
             > "$RESPONSE"
           test -s "$RESPONSE"
           RESPONSE="$RESPONSE" python - <<'PY'
@@ -87,18 +89,61 @@ jobs:
           path = Path(os.environ["RESPONSE"])
           payload = json.loads(path.read_text(encoding="utf-8"))
           if "error" in payload:
-              raise SystemExit(f"MCP returned error: {payload['error']}")
+              raise SystemExit(f"MCP JSON-RPC error: {payload['error']}")
           result = payload.get("result") or {}
+          if result.get("isError") is True:
+              raise SystemExit("MCP tool result isError=true")
           content = result.get("content") or []
-          texts = [item.get("text", "") for item in content if item.get("type") == "text"]
-          if not texts:
-              raise SystemExit("MCP response contained no text content")
-          joined = "\n".join(texts).lower()
-          if "github" not in joined or "mcp" not in joined:
-              raise SystemExit("MCP response did not contain expected README identity")
-          print(f"validated_text_items={len(texts)} response_bytes={path.stat().st_size}")
+          if not content:
+              raise SystemExit("MCP response contained no content items")
+
+          diagnostics = []
+          success_messages = []
+          embedded_texts = []
+          for item in content:
+              item_type = item.get("type", "")
+              if item_type == "text":
+                  text = item.get("text", "")
+                  success_messages.append(text)
+                  diagnostics.append({"type": "text", "length": len(text), "prefix": text[:160]})
+              elif item_type == "resource":
+                  resource = item.get("resource") or {}
+                  text = resource.get("text", "")
+                  embedded_texts.append(text)
+                  diagnostics.append({
+                      "type": "resource",
+                      "uri": resource.get("uri"),
+                      "mimeType": resource.get("mimeType"),
+                      "length": len(text),
+                      "prefix": text[:160],
+                  })
+              else:
+                  diagnostics.append({"type": item_type, "keys": sorted(item.keys())})
+
+          print("QPS_M03_RESPONSE_DIAGNOSTIC=" + json.dumps({
+              "result_keys": sorted(result.keys()),
+              "content": diagnostics,
+              "response_bytes": path.stat().st_size,
+          }, sort_keys=True))
+
+          if not any("successfully downloaded" in text.lower() for text in success_messages):
+              raise SystemExit("get_file_contents did not return a success message")
+          if not embedded_texts or not any(text.strip() for text in embedded_texts):
+              raise SystemExit("get_file_contents returned no non-empty embedded file resource")
+          readme = "\n".join(embedded_texts).lower()
+          if "github mcp server" not in readme:
+              raise SystemExit("embedded README resource did not contain expected title")
+          print(f"validated_content_items={len(content)} embedded_resources={len(embedded_texts)}")
           PY
           echo "response_path=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw public MCP response diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-live-read-response
+          path: m03_live_read_response.json
+          if-no-files-found: warn
 
       - name: Emit exact-source QPS operation receipt
         env:
@@ -121,6 +166,7 @@ jobs:
               "official_source_sha": os.environ["OFFICIAL_SHA"],
               "operation": "get_file_contents",
               "target": "github/github-mcp-server:README.md",
+              "target_sha": os.environ["OFFICIAL_SHA"],
               "toolset": "repos",
               "transport": "official_github_mcp_server_stdio_via_mcpcurl",
               "response_sha256": hashlib.sha256(response).hexdigest(),
