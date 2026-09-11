@@ -46,13 +46,31 @@ jobs:
           "$RUNNER_TEMP/github-mcp-server" --help >/dev/null
           "$RUNNER_TEMP/mcpcurl" --help >/dev/null
 
+      - name: Prove repos tool discovery
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools --help \
+            | tee "$RUNNER_TEMP/m03-tools-help.txt"
+          grep -q "get_file_contents" "$RUNNER_TEMP/m03-tools-help.txt"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools get_file_contents --help \
+            | tee "$RUNNER_TEMP/m03-get-file-help.txt"
+          grep -q -- "--owner" "$RUNNER_TEMP/m03-get-file-help.txt"
+          grep -q -- "--repo" "$RUNNER_TEMP/m03-get-file-help.txt"
+
       - name: Execute real read-only GitHub MCP operation
         id: live_read
         working-directory: official
         run: |
           set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
           "$RUNNER_TEMP/mcpcurl" \
-            --stdio-server-cmd "$RUNNER_TEMP/github-mcp-server stdio" \
+            --stdio-server-cmd "$SERVER_CMD" \
             tools get_file_contents \
             --owner github \
             --repo github-mcp-server \
@@ -83,6 +101,7 @@ jobs:
               "official_source_sha": os.environ["OFFICIAL_SHA"],
               "operation": "get_file_contents",
               "target": "github/github-mcp-server:README.md",
+              "toolset": "repos",
               "transport": "official_github_mcp_server_stdio_via_mcpcurl",
               "response_sha256": hashlib.sha256(response).hexdigest(),
               "executed_steps_claim": ">0",
