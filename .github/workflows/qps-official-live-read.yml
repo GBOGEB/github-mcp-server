@@ -1,0 +1,141 @@
+name: QPS Official MCP Live Read
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-live-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OFFICIAL_SHA: 7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${{ github.token }}
+    steps:
+      - name: Probe identity
+        run: |
+          echo "QPS_MISSION=M03_GITHUB_MCP_SERVER"
+          echo "QPS_PULSE=P_M03_OFFICIAL_LIVE_READ_02"
+          echo "CARRIER_SHA=${GITHUB_SHA}"
+          echo "OFFICIAL_SHA=${OFFICIAL_SHA}"
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+
+      - name: Checkout official exact source
+        uses: actions/checkout@v4
+        with:
+          repository: github/github-mcp-server
+          ref: ${{ env.OFFICIAL_SHA }}
+          path: official
+          fetch-depth: 1
+
+      - name: Set up Go from official source
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: official/go.mod
+          cache: false
+
+      - name: Build official server and mcpcurl
+        working-directory: official
+        run: |
+          go build -o "$RUNNER_TEMP/github-mcp-server" ./cmd/github-mcp-server
+          go build -o "$RUNNER_TEMP/mcpcurl" ./cmd/mcpcurl
+          "$RUNNER_TEMP/github-mcp-server" --help >/dev/null
+          "$RUNNER_TEMP/mcpcurl" --help >/dev/null
+
+      - name: Prove repos tool discovery
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools --help \
+            | tee "$RUNNER_TEMP/m03-tools-help.txt"
+          grep -q "get_file_contents" "$RUNNER_TEMP/m03-tools-help.txt"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools get_file_contents --help \
+            | tee "$RUNNER_TEMP/m03-get-file-help.txt"
+          grep -q -- "--owner" "$RUNNER_TEMP/m03-get-file-help.txt"
+          grep -q -- "--repo" "$RUNNER_TEMP/m03-get-file-help.txt"
+
+      - name: Execute real read-only GitHub MCP operation
+        id: live_read
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          RESPONSE="$RUNNER_TEMP/m03-live-read-response.json"
+          "$RUNNER_TEMP/mcpcurl" \
+            --pretty=false \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools get_file_contents \
+            --owner github \
+            --repo github-mcp-server \
+            --path README.md \
+            > "$RESPONSE"
+          test -s "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESPONSE"])
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if "error" in payload:
+              raise SystemExit(f"MCP returned error: {payload['error']}")
+          result = payload.get("result") or {}
+          content = result.get("content") or []
+          texts = [item.get("text", "") for item in content if item.get("type") == "text"]
+          if not texts:
+              raise SystemExit("MCP response contained no text content")
+          joined = "\n".join(texts).lower()
+          if "github" not in joined or "mcp" not in joined:
+              raise SystemExit("MCP response did not contain expected README identity")
+          print(f"validated_text_items={len(texts)} response_bytes={path.stat().st_size}")
+          PY
+          echo "response_path=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Emit exact-source QPS operation receipt
+        env:
+          RESPONSE_PATH: ${{ steps.live_read.outputs.response_path }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          response = Path(os.environ["RESPONSE_PATH"]).read_bytes()
+          receipt = {
+              "mission_id": "M03_GITHUB_MCP_SERVER",
+              "pulse_id": "P_M03_OFFICIAL_LIVE_READ_02",
+              "carrier_repo": os.environ["GITHUB_REPOSITORY"],
+              "carrier_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "official_repo": "github/github-mcp-server",
+              "official_source_sha": os.environ["OFFICIAL_SHA"],
+              "operation": "get_file_contents",
+              "target": "github/github-mcp-server:README.md",
+              "toolset": "repos",
+              "transport": "official_github_mcp_server_stdio_via_mcpcurl",
+              "response_sha256": hashlib.sha256(response).hexdigest(),
+              "executed_steps_claim": ">0",
+              "result": "PASS",
+              "authority": "REAL_READ_ONLY_OPERATION_NOT_YET_FULL_QPS_TRANSPORT_EQUIVALENCE",
+          }
+          out = Path("m03_official_live_read_receipt.json")
+          out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+
+      - name: Upload M03 live-operation receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-live-read-receipt
+          path: m03_official_live_read_receipt.json
+          if-no-files-found: error
