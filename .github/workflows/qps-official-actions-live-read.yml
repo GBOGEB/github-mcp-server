@@ -1,0 +1,190 @@
+name: QPS Official MCP Actions Live Read
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  official-actions-live-read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OFFICIAL_SHA: 7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${{ github.token }}
+      TARGET_OWNER: GBOGEB
+      TARGET_REPO: github-mcp-server
+      TARGET_WORKFLOW: qps-official-live-read.yml
+    steps:
+      - name: Probe identity
+        run: |
+          echo "QPS_MISSION=M03_GITHUB_MCP_SERVER"
+          echo "QPS_PULSE=P_M03_OFFICIAL_ACTIONS_LIVE_READ_02"
+          echo "CARRIER_SHA=${GITHUB_SHA}"
+          echo "OFFICIAL_SHA=${OFFICIAL_SHA}"
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+
+      - name: Checkout official exact source
+        uses: actions/checkout@v4
+        with:
+          repository: github/github-mcp-server
+          ref: ${{ env.OFFICIAL_SHA }}
+          path: official
+          fetch-depth: 1
+
+      - name: Set up Go from official source
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: official/go.mod
+          cache: false
+
+      - name: Build official server and mcpcurl
+        working-directory: official
+        run: |
+          go build -o "$RUNNER_TEMP/github-mcp-server" ./cmd/github-mcp-server
+          go build -o "$RUNNER_TEMP/mcpcurl" ./cmd/mcpcurl
+          "$RUNNER_TEMP/github-mcp-server" --help >/dev/null
+          "$RUNNER_TEMP/mcpcurl" --help >/dev/null
+
+      - name: Prove Actions tool discovery
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=actions"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools --help \
+            | tee "$RUNNER_TEMP/m03-actions-tools-help.txt"
+          grep -q "actions_list" "$RUNNER_TEMP/m03-actions-tools-help.txt"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools actions_list --help \
+            | tee "$RUNNER_TEMP/m03-actions-list-help.txt"
+          grep -q -- "--method" "$RUNNER_TEMP/m03-actions-list-help.txt"
+          grep -q -- "--owner" "$RUNNER_TEMP/m03-actions-list-help.txt"
+          grep -q -- "--repo" "$RUNNER_TEMP/m03-actions-list-help.txt"
+          grep -q -- "--resource_id" "$RUNNER_TEMP/m03-actions-list-help.txt"
+
+      - name: Execute and validate live Actions MCP operation
+        id: live_actions_read
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=actions"
+          RESPONSE="$GITHUB_WORKSPACE/m03_actions_live_read_response.json"
+          "$RUNNER_TEMP/mcpcurl" \
+            --pretty=false \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools actions_list \
+            --method list_workflow_runs \
+            --owner "$TARGET_OWNER" \
+            --repo "$TARGET_REPO" \
+            --resource_id "$TARGET_WORKFLOW" \
+            > "$RESPONSE"
+          test -s "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESPONSE"])
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if "error" in payload:
+              raise SystemExit(f"MCP JSON-RPC error: {payload['error']}")
+          result = payload.get("result") or {}
+          if result.get("isError") is True:
+              raise SystemExit("MCP tool result isError=true")
+          content = result.get("content") or []
+          texts = [item.get("text", "") for item in content if item.get("type") == "text" and item.get("text")]
+          if not texts:
+              raise SystemExit("actions_list returned no text payload")
+
+          decoded = []
+          for text in texts:
+              try:
+                  decoded.append(json.loads(text))
+              except json.JSONDecodeError:
+                  continue
+          if not decoded:
+              raise SystemExit("actions_list text payload was not JSON")
+
+          def walk(value):
+              if isinstance(value, dict):
+                  yield value
+                  for item in value.values():
+                      yield from walk(item)
+              elif isinstance(value, list):
+                  for item in value:
+                      yield from walk(item)
+
+          objects = [obj for root in decoded for obj in walk(root)]
+          run_like = [
+              obj for obj in objects
+              if obj.get("id") is not None
+              and (obj.get("status") is not None or obj.get("conclusion") is not None)
+          ]
+          if not run_like:
+              raise SystemExit("actions_list returned no workflow-run-like records")
+          named = [obj for obj in run_like if "qps official mcp live read" in str(obj.get("name", "")).lower()]
+          print(json.dumps({
+              "decoded_roots": len(decoded),
+              "run_like_records": len(run_like),
+              "target_named_records": len(named),
+              "sample_ids": [obj.get("id") for obj in run_like[:5]],
+              "response_bytes": path.stat().st_size,
+          }, sort_keys=True))
+          PY
+          echo "response_path=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw public Actions MCP response diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-actions-live-read-response
+          path: m03_actions_live_read_response.json
+          if-no-files-found: error
+
+      - name: Emit exact-source QPS Actions operation receipt
+        env:
+          RESPONSE_PATH: ${{ steps.live_actions_read.outputs.response_path }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          response = Path(os.environ["RESPONSE_PATH"]).read_bytes()
+          receipt = {
+              "mission_id": "M03_GITHUB_MCP_SERVER",
+              "pulse_id": "P_M03_OFFICIAL_ACTIONS_LIVE_READ_02",
+              "carrier_repo": os.environ["GITHUB_REPOSITORY"],
+              "carrier_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "official_repo": "github/github-mcp-server",
+              "official_source_sha": os.environ["OFFICIAL_SHA"],
+              "toolset": "actions",
+              "tool": "actions_list",
+              "method": "list_workflow_runs",
+              "target_repo": f"{os.environ['TARGET_OWNER']}/{os.environ['TARGET_REPO']}",
+              "resource_id": os.environ["TARGET_WORKFLOW"],
+              "transport": "official_github_mcp_server_stdio_via_mcpcurl",
+              "response_sha256": hashlib.sha256(response).hexdigest(),
+              "executed_steps_claim": ">0",
+              "result": "PASS",
+              "authority": "REAL_ACTIONS_READ_OPERATION_NOT_YET_FULL_QPS_TRANSPORT_EQUIVALENCE",
+          }
+          out = Path("m03_official_actions_live_read_receipt.json")
+          out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+
+      - name: Upload M03 Actions live-operation receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-actions-live-read-receipt
+          path: m03_official_actions_live_read_receipt.json
+          if-no-files-found: error
