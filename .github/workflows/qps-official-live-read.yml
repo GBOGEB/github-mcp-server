@@ -69,16 +69,36 @@ jobs:
         run: |
           set -euo pipefail
           SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          RESPONSE="$RUNNER_TEMP/m03-live-read-response.json"
           "$RUNNER_TEMP/mcpcurl" \
+            --pretty=false \
             --stdio-server-cmd "$SERVER_CMD" \
             tools get_file_contents \
             --owner github \
             --repo github-mcp-server \
             --path README.md \
-            > "$RUNNER_TEMP/m03-live-read-response.json"
-          test -s "$RUNNER_TEMP/m03-live-read-response.json"
-          grep -qi "github mcp" "$RUNNER_TEMP/m03-live-read-response.json"
-          echo "response_path=$RUNNER_TEMP/m03-live-read-response.json" >> "$GITHUB_OUTPUT"
+            > "$RESPONSE"
+          test -s "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESPONSE"])
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if "error" in payload:
+              raise SystemExit(f"MCP returned error: {payload['error']}")
+          result = payload.get("result") or {}
+          content = result.get("content") or []
+          texts = [item.get("text", "") for item in content if item.get("type") == "text"]
+          if not texts:
+              raise SystemExit("MCP response contained no text content")
+          joined = "\n".join(texts).lower()
+          if "github" not in joined or "mcp" not in joined:
+              raise SystemExit("MCP response did not contain expected README identity")
+          print(f"validated_text_items={len(texts)} response_bytes={path.stat().st_size}")
+          PY
+          echo "response_path=$RESPONSE" >> "$GITHUB_OUTPUT"
 
       - name: Emit exact-source QPS operation receipt
         env:
