@@ -1,0 +1,158 @@
+name: QPS Official MCP Branch Write
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  official-branch-write:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OFFICIAL_SHA: 7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${{ github.token }}
+      TARGET_OWNER: GBOGEB
+      TARGET_REPO: github-mcp-server
+    steps:
+      - name: Probe identity
+        run: |
+          echo "QPS_MISSION=M03_GITHUB_MCP_SERVER"
+          echo "QPS_PULSE=P_M03_OFFICIAL_BRANCH_WRITE_01"
+          echo "CARRIER_SHA=${GITHUB_SHA}"
+          echo "OFFICIAL_SHA=${OFFICIAL_SHA}"
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+
+      - name: Checkout official exact source
+        uses: actions/checkout@v4
+        with:
+          repository: github/github-mcp-server
+          ref: ${{ env.OFFICIAL_SHA }}
+          path: official
+          fetch-depth: 1
+
+      - name: Set up Go from official source
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: official/go.mod
+          cache: false
+
+      - name: Build official server and mcpcurl
+        working-directory: official
+        run: |
+          go build -o "$RUNNER_TEMP/github-mcp-server" ./cmd/github-mcp-server
+          go build -o "$RUNNER_TEMP/mcpcurl" ./cmd/mcpcurl
+
+      - name: Prove branch-create tool schema
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          "$RUNNER_TEMP/mcpcurl" \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools create_branch --help \
+            | tee "$RUNNER_TEMP/m03-create-branch-help.txt"
+          grep -q -- "--owner" "$RUNNER_TEMP/m03-create-branch-help.txt"
+          grep -q -- "--repo" "$RUNNER_TEMP/m03-create-branch-help.txt"
+          grep -q -- "--branch" "$RUNNER_TEMP/m03-create-branch-help.txt"
+          grep -q -- "--from_branch" "$RUNNER_TEMP/m03-create-branch-help.txt"
+
+      - name: Execute and validate official MCP branch mutation
+        id: branch_write
+        working-directory: official
+        run: |
+          set -euo pipefail
+          SERVER_CMD="$RUNNER_TEMP/github-mcp-server stdio --toolsets=repos"
+          PROBE_BRANCH="probe/m03-official-write-${GITHUB_RUN_ID}"
+          RESPONSE="$GITHUB_WORKSPACE/m03_branch_write_response.json"
+          "$RUNNER_TEMP/mcpcurl" \
+            --pretty=false \
+            --stdio-server-cmd "$SERVER_CMD" \
+            tools create_branch \
+            --owner "$TARGET_OWNER" \
+            --repo "$TARGET_REPO" \
+            --branch "$PROBE_BRANCH" \
+            --from_branch main \
+            > "$RESPONSE"
+          test -s "$RESPONSE"
+          RESPONSE="$RESPONSE" PROBE_BRANCH="$PROBE_BRANCH" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESPONSE"])
+          probe = os.environ["PROBE_BRANCH"]
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if "error" in payload:
+              raise SystemExit(f"MCP JSON-RPC error: {payload['error']}")
+          result = payload.get("result") or {}
+          if result.get("isError") is True:
+              raise SystemExit("MCP tool result isError=true")
+          content = result.get("content") or []
+          texts = [item.get("text", "") for item in content if item.get("type") == "text"]
+          if not texts:
+              raise SystemExit("create_branch returned no text result")
+          joined = "\n".join(texts)
+          if probe not in joined and f"refs/heads/{probe}" not in joined:
+              raise SystemExit("branch-create response did not bind requested branch name")
+          print(json.dumps({
+              "probe_branch": probe,
+              "response_bytes": path.stat().st_size,
+              "text_items": len(texts),
+          }, sort_keys=True))
+          PY
+          echo "response_path=$RESPONSE" >> "$GITHUB_OUTPUT"
+          echo "probe_branch=$PROBE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw branch-write response
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-branch-write-response
+          path: m03_branch_write_response.json
+          if-no-files-found: error
+
+      - name: Emit exact-source mutation receipt
+        env:
+          RESPONSE_PATH: ${{ steps.branch_write.outputs.response_path }}
+          PROBE_BRANCH: ${{ steps.branch_write.outputs.probe_branch }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          response = Path(os.environ["RESPONSE_PATH"]).read_bytes()
+          receipt = {
+              "mission_id": "M03_GITHUB_MCP_SERVER",
+              "pulse_id": "P_M03_OFFICIAL_BRANCH_WRITE_01",
+              "carrier_repo": os.environ["GITHUB_REPOSITORY"],
+              "carrier_sha": os.environ["GITHUB_SHA"],
+              "run_id": os.environ["GITHUB_RUN_ID"],
+              "official_repo": "github/github-mcp-server",
+              "official_source_sha": os.environ["OFFICIAL_SHA"],
+              "toolset": "repos",
+              "tool": "create_branch",
+              "target_repo": f"{os.environ['TARGET_OWNER']}/{os.environ['TARGET_REPO']}",
+              "probe_branch": os.environ["PROBE_BRANCH"],
+              "from_branch": "main",
+              "transport": "official_github_mcp_server_stdio_via_mcpcurl",
+              "response_sha256": hashlib.sha256(response).hexdigest(),
+              "executed_steps_claim": ">0",
+              "result": "PASS",
+              "authority": "ONE_REAL_STANDARD_WRITE_MUTATION_NOT_FULL_WRITE_EQUIVALENCE",
+          }
+          out = Path("m03_official_branch_write_receipt.json")
+          out.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+
+      - name: Upload M03 mutation receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: m03-official-branch-write-receipt
+          path: m03_official_branch_write_receipt.json
+          if-no-files-found: error
