@@ -1,0 +1,60 @@
+name: QPS Official MCP Actions Proof
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-actions-proof:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe identity
+        run: |
+          echo "QPS_MISSION=M03_GITHUB_MCP_SERVER"
+          echo "OFFICIAL_SOURCE=github/github-mcp-server@7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d"
+          echo "CARRIER_SHA=${GITHUB_SHA}"
+          echo "RUNNER_NAME=${RUNNER_NAME}"
+
+      - name: Checkout official exact source
+        uses: actions/checkout@v4
+        with:
+          repository: github/github-mcp-server
+          ref: 7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
+          path: official
+
+      - name: Set up Go from official source
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: official/go.mod
+          cache: false
+
+      - name: Prove minimal Actions run and job representation
+        working-directory: official
+        run: >-
+          go test ./pkg/github
+          -run 'TestConvertToMinimalWorkflowRun|TestConvertToMinimalWorkflowJob|TestConvertToMinimalActionsLists'
+          -count=1 -v
+
+      - name: Emit QPS smoke receipt
+        shell: python
+        env:
+          OFFICIAL_SHA: 7d13a7ad6f2a17f351a6d77ce280c85ae1821f4d
+        run: |
+          import json, os
+          receipt = {
+              "mission_id": "M03_GITHUB_MCP_SERVER",
+              "pulse_id": "P_M03_OFFICIAL_ACTIONS_RUNTIME_01",
+              "carrier_repo": os.environ.get("GITHUB_REPOSITORY"),
+              "carrier_sha": os.environ.get("GITHUB_SHA"),
+              "official_repo": "github/github-mcp-server",
+              "official_source_sha": os.environ["OFFICIAL_SHA"],
+              "runner_name": os.environ.get("RUNNER_NAME"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "claim": "official exact source compiled and passed minimal Actions run/job representation tests",
+              "authority": "SMOKE_ONLY_NOT_QPS_TRANSPORT_EQUIVALENCE",
+          }
+          print(json.dumps(receipt, sort_keys=True))
